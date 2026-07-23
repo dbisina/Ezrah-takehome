@@ -1,0 +1,92 @@
+name: ezrah-credential-pipeline
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ezrah
+      POSTGRES_PASSWORD: ezrah
+      POSTGRES_DB: ezrah
+    # Host port 5433 (not 5432) to avoid colliding with a locally-installed
+    # Postgres. The app connects internally over the compose network, so this
+    # mapping is only for optional inspection from the host.
+    ports:
+      - '5433:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ezrah -d ezrah']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.7.0
+    # Host port 9094 (internal listener stays 9092) to avoid host collisions;
+    # only used for optional inspection from the host.
+    ports:
+      - '9094:9092'
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Auto-creation is OFF on purpose: the init service provisions topics with
+      # explicit partition counts. Auto-create would silently collapse them to 1.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_CLUSTER_ID: ezrah-local-cluster-0001
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  # Run-once: apply migrations and provision Kafka topics, then exit. The app
+  # waits for this to complete successfully, so startup is race-free.
+  init:
+    build: .
+    command: sh -c "npx prisma migrate deploy && node dist/scripts/provision-topics.js"
+    environment:
+      DATABASE_URL: postgresql://ezrah:ezrah@postgres:5432/ezrah?schema=public
+      KAFKA_BROKERS: kafka:9092
+      STEP_TOPIC_PARTITIONS: '6'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: 'no'
+
+  app:
+    build: .
+    command: node dist/main.js
+    environment:
+      GRPC_URL: 0.0.0.0:50051
+      DATABASE_URL: postgresql://ezrah:ezrah@postgres:5432/ezrah?schema=public
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CLIENT_ID: ezrah-credential-pipeline
+      APP_INSTANCE_ID: app-1
+      STEP_TOPIC_PARTITIONS: '6'
+      IDENTITY_FAILURE_RATE: '0.25'
+      SIGNING_FAILURE_RATE: '0.25'
+      IDENTITY_DELAY_MS: '400'
+      SIGNING_DELAY_MS: '600'
+      MAX_STEP_ATTEMPTS: '4'
+      OUTBOX_POLL_INTERVAL_MS: '400'
+    ports:
+      - '50051:50051'
+    # Lets the in-Docker callback consumer reach a callback sink running on the host.
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    depends_on:
+      init:
+        condition: service_completed_successfully

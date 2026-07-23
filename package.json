@@ -1,0 +1,42 @@
+{
+  "name": "ezrah-credential-pipeline",
+  "version": "1.0.0",
+  "description": "Ezrah internal credential-issuance pipeline: gRPC + Kafka + Postgres (NestJS, TypeScript strict)",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "build": "prisma generate && tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "start:dev": "ts-node -r tsconfig-paths/register src/main.ts",
+    "demo": "ts-node src/scripts/demo-client.ts",
+    "demo:retry": "ts-node src/scripts/demo-retry.ts",
+    "test": "jest --config jest.config.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.12.5",
+    "@grpc/proto-loader": "^0.7.13",
+    "@nestjs/common": "^11.0.1",
+    "@nestjs/config": "^4.0.0",
+    "@nestjs/core": "^11.0.1",
+    "@nestjs/microservices": "^11.0.1",
+    "@prisma/client": "^6.2.1",
+    "kafkajs": "^2.2.4",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "^11.0.1",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.5",
+    "jest": "^29.7.0",
+    "prisma": "^6.2.1",
+    "ts-jest": "^29.2.5",
+    "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
+    "typescript": "^5.7.3"
+  }
+}

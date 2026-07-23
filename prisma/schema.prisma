@@ -1,0 +1,170 @@
+// Postgres is the source of truth for pipeline state. Kafka carries work and
+// fan-out; Postgres records what actually happened. The pipeline_event table is
+// an append-only log that a caller can replay to reconstruct any request.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CredentialType {
+  EmploymentCredential
+  IdentityCredential
+  KYCCredential
+}
+
+enum PipelineStep {
+  IDENTITY_VERIFICATION
+  CLAIMS_VALIDATION
+  CREDENTIAL_SIGNING
+}
+
+enum RequestStatus {
+  ACCEPTED
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum StepState {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum EventType {
+  REQUEST_ACCEPTED
+  STEP_STARTED
+  STEP_SUCCEEDED
+  STEP_FAILED
+  REQUEST_COMPLETED
+  REQUEST_FAILED
+}
+
+enum CallbackStatus {
+  PENDING
+  DELIVERED
+  FAILED
+  EXHAUSTED
+}
+
+/// One credential request. `idempotencyKey` is the dedup boundary: a unique
+/// constraint here is what makes duplicate submissions safe.
+model CredentialRequest {
+  id               String         @id @default(uuid()) @db.Uuid
+  idempotencyKey   String         @unique @map("idempotency_key")
+  subjectDid       String         @map("subject_did")
+  credentialType   CredentialType @map("credential_type")
+  claims           Json
+  callbackUrl      String?        @map("callback_url")
+  status           RequestStatus  @default(ACCEPTED)
+  currentStep      PipelineStep?  @map("current_step")
+  signedCredential Json?          @map("signed_credential")
+  failureStep      PipelineStep?  @map("failure_step")
+  failureReason    String?        @map("failure_reason")
+  // Monotonic high-water mark for this request's event sequence. Updated under a
+  // row lock so concurrent transitions cannot produce gaps or duplicates.
+  lastSequence     Int            @default(0) @map("last_sequence")
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+  completedAt      DateTime?      @map("completed_at")
+
+  steps  StepExecution[]
+  events PipelineEvent[]
+
+  @@index([status])
+  @@map("credential_request")
+}
+
+/// Per-step execution state. `@@unique([requestId, step])` guarantees exactly
+/// one row per step, so a consumer can atomically check "did this step already
+/// succeed?" before doing any work; this is the core of resume-from-failure and
+/// duplicate-delivery safety.
+model StepExecution {
+  id         String       @id @default(uuid()) @db.Uuid
+  requestId  String       @map("request_id") @db.Uuid
+  step       PipelineStep
+  state      StepState    @default(PENDING)
+  attempts   Int          @default(0)
+  error      String?
+  startedAt  DateTime?    @map("started_at")
+  finishedAt DateTime?    @map("finished_at")
+
+  request CredentialRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, step])
+  @@map("step_execution")
+}
+
+/// Append-only event log. `@@unique([requestId, sequence])` makes the log
+/// gap-detectable and idempotent to append. This is what Watch replays and what
+/// a caller can use to reconstruct full request state.
+model PipelineEvent {
+  id         String        @id @default(uuid()) @db.Uuid
+  requestId  String        @map("request_id") @db.Uuid
+  sequence   Int
+  type       EventType
+  step       PipelineStep?
+  status     String
+  data       Json
+  occurredAt DateTime      @default(now()) @map("occurred_at")
+
+  request CredentialRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([requestId, sequence])
+  @@index([requestId, sequence])
+  @@map("pipeline_event")
+}
+
+/// Transactional outbox. Every Kafka publish is first written here in the SAME
+/// transaction as the state change that caused it. A relay drains this table and
+/// publishes to Kafka, so a crash between "commit state" and "publish to Kafka"
+/// cannot lose or double-drive work.
+model OutboxMessage {
+  id          String    @id @default(uuid()) @db.Uuid
+  aggregateId String    @map("aggregate_id") @db.Uuid
+  topic       String
+  messageKey  String    @map("message_key")
+  payload     Json
+  headers     Json?
+  attempts    Int       @default(0)
+  // The relay only publishes rows whose visibleAfter has passed. This is how
+  // delayed retries are scheduled: enqueue a step command with a future
+  // visibleAfter instead of sleeping inside a Kafka consumer (which would trip
+  // max.poll.interval.ms and trigger a rebalance).
+  visibleAfter DateTime @default(now()) @map("visible_after")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  publishedAt DateTime? @map("published_at")
+
+  @@index([publishedAt, visibleAfter, createdAt])
+  @@map("outbox_message")
+}
+
+/// Tracks delivery of the final outcome to a caller's callback URL, including
+/// retry attempts. Kept separate from the pipeline so a slow/broken webhook
+/// never blocks credential processing.
+model CallbackDelivery {
+  id             String         @id @default(uuid()) @db.Uuid
+  requestId      String         @map("request_id") @db.Uuid
+  // The terminal outcome being delivered. Keyed together with requestId so a
+  // request that yields two outcomes over its lifetime (FAILED, then COMPLETED
+  // after a manual Retry) gets a separate delivery record for each; one
+  // DELIVERED FAILED outcome must not suppress a later COMPLETED delivery.
+  terminalStatus RequestStatus  @map("terminal_status")
+  url            String
+  status         CallbackStatus @default(PENDING)
+  attempts       Int            @default(0)
+  lastError      String?        @map("last_error")
+  deliveredAt    DateTime?      @map("delivered_at")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  @@unique([requestId, terminalStatus])
+  @@index([requestId])
+  @@map("callback_delivery")
+}
